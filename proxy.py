@@ -15,13 +15,14 @@ import os
 import sys
 import time
 import uuid
+from typing import Iterable, Optional
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import config
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from transformer import BlockNotSupportedError, ImageSourceError, scan_content
+from transformer import ImageSourceError, scan_content
 from cache import get_or_compute
 from vision_fake import analyze_image as fake_analyze
 
@@ -85,6 +86,79 @@ def _log(level: str, request_id: str, **kwargs):
             pass
 
 
+def _sse_event_is_terminal(lines: Iterable[bytes]) -> bool:
+    """Return True when an SSE event is the final model event.
+
+    Anthropic-compatible streams end with ``event: message_stop``. Some
+    OpenAI-compatible streams end with ``data: [DONE]``. The proxy should stop
+    reading once either is forwarded, because some upstreams keep the HTTP
+    connection open briefly after the logical stream is complete.
+    """
+    for raw_line in lines:
+        line = raw_line.strip()
+        if line == b"event: message_stop":
+            return True
+        if line == b"data: [DONE]":
+            return True
+    return False
+
+
+def _forward_sse_stream(resp, wfile) -> bool:
+    """Forward an SSE stream and stop at the logical terminal event.
+
+    Returns True if the downstream client closed the connection.
+    """
+    event_lines = []
+    while True:
+        line = resp.readline()
+        if not line:
+            break
+        event_lines.append(line)
+        try:
+            wfile.write(line)
+            wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            return True
+        if line in (b"\n", b"\r\n"):
+            if _sse_event_is_terminal(event_lines):
+                break
+            event_lines = []
+    return False
+
+
+def _prepare_upstream_body(body_bytes: bytes, vision_fn=_process_image) -> tuple:
+    """Return (upstream_body_bytes, parsed_request, image_count).
+
+    The no-image path is intentionally byte-for-byte pass-through. We parse only
+    to detect direct Anthropic image blocks under messages[].content; if none are
+    present, the original request body is forwarded unchanged.
+    """
+    parsed = json.loads(body_bytes)
+    total_count = 0
+
+    if not isinstance(parsed, dict):
+        return body_bytes, parsed, 0
+
+    messages = parsed.get("messages", [])
+    if isinstance(messages, list):
+        for msg in messages:
+            if not isinstance(msg, dict):
+                continue
+            content = msg.get("content")
+            if content is None:
+                continue
+            new_content, count = scan_content(content, vision_fn=vision_fn)
+            if count:
+                msg["content"] = new_content
+                total_count += count
+
+    if total_count == 0:
+        return body_bytes, parsed, 0
+
+    transformed_body = json.dumps(parsed, ensure_ascii=False).encode("utf-8")
+    return transformed_body, parsed, total_count
+
+
 class ProxyHandler(BaseHTTPRequestHandler):
 
     def log_message(self, format, *args):
@@ -92,7 +166,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
     # ── body reading ──────────────────────────────────────
 
-    def _read_body(self) -> bytes | None:
+    def _read_body(self) -> Optional[bytes]:
         cl = self.headers.get("Content-Length")
         if not cl:
             self._send_error(400, "缺少 Content-Length"); return None
@@ -144,10 +218,8 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
     # ── upstream forwarding ───────────────────────────────
 
-    def _forward_to_deepseek(self, request_id: str, body_str: str, auth: dict, t0: float):
+    def _forward_to_deepseek(self, request_id: str, body_bytes: bytes, auth: dict, t0: float):
         """转发请求到 DeepSeek，处理 SSE / 非流式。"""
-        body_bytes = body_str.encode("utf-8")
-
         out_headers = {
             "Content-Type": "application/json",
             "Anthropic-Version": "2023-06-01",
@@ -196,17 +268,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
         try:
             if is_sse:
-                # SSE: read(8192) 循环 + flush
-                while True:
-                    chunk = resp.read(8192)
-                    if not chunk:
-                        break
-                    try:
-                        self.wfile.write(chunk)
-                        self.wfile.flush()
-                    except (BrokenPipeError, ConnectionResetError):
-                        client_closed = True
-                        break
+                client_closed = _forward_sse_stream(resp, self.wfile)
             else:
                 # 非流式：直接读完整 body
                 full_body = resp.read()
@@ -262,32 +324,17 @@ class ProxyHandler(BaseHTTPRequestHandler):
         if body_bytes is None:
             return
 
-        try:
-            parsed = json.loads(body_bytes)
-        except json.JSONDecodeError as e:
-            self._send_error(400, f"JSON 解析失败: {e}"); return
-
         # ── 图片扫描与替换 ──
         try:
-            total_count = 0
-            for msg in parsed.get("messages", []):
-                content = msg.get("content")
-                if content is not None:
-                    new_content, count = scan_content(content, vision_fn=_process_image)
-                    msg["content"] = new_content
-                    total_count += count
-            image_count = total_count
+            transformed_body, parsed, image_count = _prepare_upstream_body(body_bytes)
+        except json.JSONDecodeError as e:
+            self._send_error(400, f"JSON 解析失败: {e}"); return
         except ImageSourceError as e:
             _log("warn", request_id, error="image_source", detail=e.message)
-            self._send_error(e.status_code, e.message); return
-        except BlockNotSupportedError as e:
-            _log("warn", request_id, error="unsupported_block", detail=e.message)
             self._send_error(e.status_code, e.message); return
         except Exception as e:
             _log("error", request_id, error="transform", detail=str(e))
             self._send_error(500, f"图片处理异常: {e}"); return
-
-        transformed_body = json.dumps(parsed, ensure_ascii=False)
 
         if config.DEBUG_MODE:
             global last_transform
@@ -357,7 +404,8 @@ def main():
 
     server = ThreadingHTTPServer((config.PROXY_HOST, config.PROXY_PORT), ProxyHandler)
     print(
-        f"[deepseek-eyes] http://{config.PROXY_HOST}:{config.PROXY_PORT} mode={mode_str}",
+        f"[deepseek-eyes] http://{config.PROXY_HOST}:{config.PROXY_PORT} "
+        f"version={config.PROJECT_VERSION} mode={mode_str}",
         file=sys.stderr,
     )
     dbg_endpoint = " /debug/transform" if config.DEBUG_MODE else ""

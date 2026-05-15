@@ -117,11 +117,19 @@ def _call_api(base64_data: str, mime: str) -> dict:
             resp_body = resp.read()
     except urllib.error.HTTPError as e:
         status = e.code
+        try:
+            err_body = e.read().decode("utf-8", errors="replace").strip()
+        except Exception:
+            err_body = ""
         if status == 401 or status == 403:
             raise RuntimeError(f"豆包 API Key 无效 (HTTP {status})，请检查 ARK_API_KEY")
         if status == 429:
             raise RuntimeError(f"豆包 API 频率限制 (HTTP 429)，请稍后重试")
-        raise RuntimeError(f"豆包 API 错误 (HTTP {status}): {e.reason}")
+        detail = f": {err_body}" if err_body else f": {e.reason}"
+        raise RuntimeError(
+            f"豆包 API 错误 (HTTP {status}){detail} "
+            f"(base_url={config.ARK_BASE_URL}, model={config.VISION_MODEL})"
+        )
     except Exception as e:
         raise RuntimeError(f"豆包 API 网络错误: {e}")
 

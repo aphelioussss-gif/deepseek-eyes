@@ -1,32 +1,14 @@
-"""DeepSeek Eyes — 递归图片替换器。
+"""DeepSeek Eyes — Anthropic 图片替换器。
 
-扫描 Anthropic Messages API 的 content 结构，将 type=image 替换为 type=text。
-只扫描 Anthropic content surface（messages[].content, tool_result.content），
-不进入 tool_use.input / metadata / 未知 dict。
+只扫描 Anthropic Messages API 的 messages[].content 直接子 block，
+将真正的 ``{"type": "image"}`` content block 替换为 text。
+不进入 tool_use.input / tool_result.content / metadata / 未知 dict。
 """
 
 import base64
 from typing import Any, Callable, Optional
 
 SUPPORTED_MIME = {"image/png", "image/jpeg", "image/webp", "image/gif"}
-
-DEEPSEEK_UNSUPPORTED_BLOCKS = {
-    "document",
-    "search_result",
-    "server_tool_use",
-    "mcp_tool_use",
-    "mcp_tool_result",
-}
-
-SCANNABLE_BLOCK_TYPES = {
-    "text",
-    "image",
-    "tool_use",
-    "tool_result",
-    "thinking",
-    "redacted_thinking",
-}
-
 
 class ImageSourceError(Exception):
     def __init__(self, message: str, status_code: int = 400):
@@ -97,29 +79,16 @@ def replace_images(
     return {"type": "text", "text": text}, 1
 
 
-def _validate_blocks(content: list) -> None:
-    """检测 DeepSeek 不支持的 block type，检测到则抛出 BlockNotSupportedError。"""
-    for block in content:
-        if not isinstance(block, dict):
-            continue
-        bt = block.get("type")
-        if bt in DEEPSEEK_UNSUPPORTED_BLOCKS:
-            raise BlockNotSupportedError(
-                f"DeepSeek 不支持 content block type: {bt}。代理 v1 只转换 image。",
-                400,
-            )
-
-
 def scan_content(
     node: Any,
     vision_fn: Optional[Callable[[bytes, str], str]] = None,
 ) -> tuple:
-    """递归扫描 Anthropic content 节点，替换所有 image block。
+    """扫描 Anthropic message.content，替换直接 image block。
 
     扫描边界：
     ✓ messages[].content (str / list)
     ✓ content block: type=image
-    ✓ content block: type=tool_result → 递归 .content
+    ✗ tool_result.content（工具输出必须透明转发）
     ✗ tool_use.input（业务数据）
     ✗ 未知 dict type（未来兼容但保守）
     ✗ system prompt string
@@ -130,7 +99,7 @@ def scan_content(
                    为 None 时仅做 unsupported block 检测。
 
     Returns:
-        (transformed_node, image_count)
+        (transformed_node, image_count)。没有图片时返回原节点。
     """
     if vision_fn is None:
         vision_fn = lambda b, m: "[无视觉处理器]"
@@ -141,8 +110,6 @@ def scan_content(
 
     # 列表 content → 逐元素扫描
     if isinstance(node, list):
-        _validate_blocks(node)
-
         total_count = 0
         result = []
         for elem in node:
@@ -159,23 +126,11 @@ def scan_content(
                 total_count += count
                 continue
 
-            # tool_result → 递归进入 .content
-            if bt == "tool_result":
-                inner = elem.get("content", [])
-                transformed_inner, count = scan_content(inner, vision_fn)
-                total_count += count
-                result.append({**elem, "content": transformed_inner})
-                continue
-
-            # tool_use → 不进入 .input
-            # text / thinking / 其他已知 scannable block → 保留
-            if bt in SCANNABLE_BLOCK_TYPES:
-                result.append(elem)
-                continue
-
-            # 未知 block type → 保留原样，不递归（保守）
+            # 非 image block 全部保留，不递归、不校验、不兼容化。
             result.append(elem)
 
+        if total_count == 0:
+            return node, 0
         return result, total_count
 
     # 其他类型（不应出现）→ 原样返回

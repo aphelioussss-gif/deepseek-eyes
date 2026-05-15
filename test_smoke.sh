@@ -20,7 +20,7 @@ json() {
 }
 
 post() {
-    curl -s -o "$TMPBODY" -w "%{http_code}" -X POST "$BASE$1" \
+    curl --noproxy '*' -s -o "$TMPBODY" -w "%{http_code}" -X POST "$BASE$1" \
         -H "Content-Type: application/json" \
         -d "$2" 2>/dev/null
 }
@@ -30,14 +30,14 @@ post_auth() {
     local args=()
     [ -n "$key" ] && args+=(-H "x-api-key: $key")
     [ -n "$bearer" ] && args+=(-H "Authorization: Bearer $bearer")
-    curl -s -o "$TMPBODY" -w "%{http_code}" -X POST "$BASE$path" \
+    curl --noproxy '*' -s -o "$TMPBODY" -w "%{http_code}" -X POST "$BASE$path" \
         -H "Content-Type: application/json" \
         "${args[@]}" \
         -d "$data" 2>/dev/null
 }
 
 get() {
-    curl -s -o "$TMPBODY" -w "%{http_code}" "$BASE$1" 2>/dev/null
+    curl --noproxy '*' -s -o "$TMPBODY" -w "%{http_code}" "$BASE$1" 2>/dev/null
 }
 
 bcat() { cat "$TMPBODY"; }
@@ -119,19 +119,33 @@ for m in d['transformed_request']['messages']:
 sys.exit(1)
 "
 
-# ── tool_result 嵌套 ──
+# ── tool_result 透明转发 ──
 echo "── tool_result ──"
 NESTED=$(json '{"model":"x","messages":[{"role":"user","content":[{"type":"text","text":"hi"},{"type":"tool_result","content":[{"type":"text","text":"r"},{"type":"image","source":{"type":"base64","media_type":"image/png","data":"'"$TEST_IMG_B64"'"}}]}]}],"max_tokens":10}')
-check "嵌套替换" "$(post /v1/messages "$NESTED")" "200" "contains" "[视觉分析]"
+check "嵌套不替换" "$(post /v1/messages "$NESTED")" "200" "py_pass" "
+import sys,json
+d=json.load(sys.stdin)
+b=d['transformed_request']['messages'][0]['content'][1]['content'][1]
+assert b.get('type') == 'image'
+assert d['image_count'] == 0
+sys.exit(0)
+"
 
 # ── source.url → 400 ──
 echo "── source.url ──"
 URL=$(json '{"model":"x","messages":[{"role":"user","content":[{"type":"image","source":{"type":"url","url":"https://x.com/i.png"}}]}],"max_tokens":10}')
 check "url→400" "$(post /v1/messages "$URL")" "400" "contains" "远程图片"
 
-# ── unsupported block → 400 ──
-echo "── unsupported ──"
-check "doc→400" "$(post /v1/messages '{"model":"x","messages":[{"role":"user","content":[{"type":"text","text":"hi"},{"type":"document","source":{"type":"base64","media_type":"application/pdf","data":"aaaa"}}]}],"max_tokens":10}')" "400" "contains" "不支持"
+# ── 非 image block 透明转发 ──
+echo "── non-image passthrough ──"
+check "doc透明转发" "$(post /v1/messages '{"model":"x","messages":[{"role":"user","content":[{"type":"text","text":"hi"},{"type":"document","source":{"type":"base64","media_type":"application/pdf","data":"aaaa"}}]}],"max_tokens":10}')" "200" "py_pass" "
+import sys,json
+d=json.load(sys.stdin)
+blocks=d['transformed_request']['messages'][0]['content']
+assert blocks[1].get('type') == 'document'
+assert d['image_count'] == 0
+sys.exit(0)
+"
 
 # ── 无图 ──
 echo "── 无图请求 ──"

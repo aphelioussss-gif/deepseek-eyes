@@ -25,7 +25,7 @@ bash claude-with-eyes.sh
 | 文件 | 功能 |
 |------|------|
 | `proxy.py` | ThreadingHTTPServer 主代理 |
-| `transformer.py` | 递归图片替换 |
+| `transformer.py` | 直接 image block 替换，不介入工具块 |
 | `vision.py` | 豆包 Chat API |
 | `vision_fake.py` | 假视觉（离线测试） |
 | `cache.py` | 线程安全图片缓存 |
@@ -36,6 +36,7 @@ bash claude-with-eyes.sh
 
 ```bash
 python3 test_transformer.py          # 15 单测
+python3 test_proxy_stream.py         # SSE + 透明转发单测
 bash start.sh debug && bash test_smoke.sh  # 14 冒烟测试 (需先启动代理)
 ```
 

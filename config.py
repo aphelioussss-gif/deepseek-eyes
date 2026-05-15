@@ -9,6 +9,7 @@ import sys
 from pathlib import Path
 
 PROJECT_DIR = Path(__file__).resolve().parent
+PROJECT_VERSION = "v1.2-lite"
 
 
 def _load_dotenv():
@@ -53,10 +54,36 @@ def _env_bool(key: str, default: bool = False) -> bool:
     return default
 
 
+def _normalize_vision_model(model: str, base_url: str) -> str:
+    """Normalize common Doubao 2.0 Lite aliases for the selected Ark API surface."""
+    normalized = model.strip()
+    key = normalized.lower()
+    base = base_url.rstrip("/")
+
+    if base.endswith("/api/v3"):
+        online_aliases = {
+            "doubao-seed-2.0-lite": "doubao-seed-2-0-lite-260215",
+            "doubao-seed-2-0-lite": "doubao-seed-2-0-lite-260215",
+            "doubao-seed-2-0-lite-260215": "doubao-seed-2-0-lite-260215",
+        }
+        return online_aliases.get(key, normalized)
+
+    if base.endswith("/api/coding/v3"):
+        coding_aliases = {
+            "doubao-seed-2-0-lite": "doubao-seed-2.0-lite",
+            "doubao-seed-2-0-lite-260215": "doubao-seed-2.0-lite",
+            "doubao-seed-2.0-lite": "doubao-seed-2.0-lite",
+        }
+        return coding_aliases.get(key, normalized)
+
+    return normalized
+
+
 # === 豆包（视觉）===
 ARK_API_KEY = _env_str("ARK_API_KEY")
-ARK_BASE_URL = _env_str("ARK_BASE_URL", "https://ark.cn-beijing.volces.com/api/v3")
-VISION_MODEL = _env_str("VISION_MODEL", "doubao-seed-1-6-vision-250815")
+ARK_BASE_URL = _env_str("ARK_BASE_URL", "https://ark.cn-beijing.volces.com/api/v3").rstrip("/")
+VISION_MODEL_RAW = _env_str("VISION_MODEL", "doubao-seed-2-0-lite-260215")
+VISION_MODEL = _normalize_vision_model(VISION_MODEL_RAW, ARK_BASE_URL)
 VISION_PROMPT_VERSION = "v1"
 VISION_TIMEOUT = _env_int("VISION_TIMEOUT", 120)
 VISION_FAIL_MODE = _env_str("VISION_FAIL_MODE", "placeholder")  # placeholder | block
@@ -95,4 +122,16 @@ def validate():
         errors.append("ARK_API_KEY 未设置（真实视觉模式需要）。或设置 DEEPSEEK_EYES_FAKE_VISION=1")
     if VISION_FAIL_MODE not in ("placeholder", "block"):
         errors.append(f"VISION_FAIL_MODE 无效值: {VISION_FAIL_MODE}")
+    if ARK_BASE_URL.endswith("/api/v3") and VISION_MODEL_RAW.lower() == "doubao-seed-2.0-lite":
+        print(
+            "[deepseek-eyes] config notice: VISION_MODEL=doubao-seed-2.0-lite "
+            "已按在线推理 /api/v3 自动改用 doubao-seed-2-0-lite-260215",
+            file=sys.stderr,
+        )
+    if ARK_BASE_URL.endswith("/api/coding/v3") and VISION_MODEL_RAW.lower() == "doubao-seed-2-0-lite-260215":
+        print(
+            "[deepseek-eyes] config notice: VISION_MODEL=doubao-seed-2-0-lite-260215 "
+            "已按 Coding Plan /api/coding/v3 自动改用 doubao-seed-2.0-lite",
+            file=sys.stderr,
+        )
     return len(errors) == 0, errors

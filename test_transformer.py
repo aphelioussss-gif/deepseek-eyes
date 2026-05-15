@@ -10,9 +10,7 @@ import traceback
 from transformer import (
     scan_content,
     replace_images,
-    DEEPSEEK_UNSUPPORTED_BLOCKS,
     ImageSourceError,
-    BlockNotSupportedError,
 )
 
 PASS = 0
@@ -85,7 +83,7 @@ def test_scan_single_image():
 
 
 def test_scan_tool_result_nested_image():
-    """tool_result.content 中的图片被替换"""
+    """tool_result.content 中的图片不被代理介入"""
     content = [
         text_block("check this screenshot"),
         {
@@ -98,9 +96,8 @@ def test_scan_tool_result_nested_image():
     ]
     mock_vision = lambda b, m: "NESTED_DESC"
     result, count = scan_content(content, mock_vision)
-    eq(count, 1, "image_count")
-    eq(result[1]["content"][1]["type"], "text", "nested image → text")
-    contains(result[1]["content"][1]["text"], "NESTED_DESC", "nested description")
+    eq(count, 0, "image_count")
+    eq(result, content, "tool_result must stay untouched")
 
 
 def test_scan_tool_use_input_untouched():
@@ -135,7 +132,7 @@ def test_scan_unknown_dict_not_recursed():
 
 
 def test_scan_deeply_nested_tool_result():
-    """多层嵌套 tool_result 中的图片"""
+    """多层嵌套 tool_result 中的图片也不处理"""
     content = [
         {
             "type": "tool_result",
@@ -150,7 +147,8 @@ def test_scan_deeply_nested_tool_result():
     ]
     mock_vision = lambda b, m: "DEEP_DESC"
     result, count = scan_content(content, mock_vision)
-    eq(count, 1, "深层嵌套图片被替换")
+    eq(count, 0, "深层嵌套工具结果不处理")
+    eq(result, content, "nested tool_result unchanged")
 
 
 # ── ImageSourceError tests ──
@@ -207,15 +205,12 @@ def test_bad_base64_raises():
 
 # ── unsupported block tests ──
 
-def test_unsupported_block_raises():
-    """DeepSeek 不支持的 block type 抛出 BlockNotSupportedError"""
-    for block_type in DEEPSEEK_UNSUPPORTED_BLOCKS:
-        content = [text_block("hello"), {"type": block_type, "data": "xxx"}]
-        try:
-            scan_content(content)
-            raise AssertionError(f"应该抛 BlockNotSupportedError for {block_type}")
-        except BlockNotSupportedError:
-            pass
+def test_unsupported_block_passthrough():
+    """非 image block 不由代理拦截，交给 DeepSeek 上游处理"""
+    content = [text_block("hello"), {"type": "document", "data": "xxx"}]
+    result, count = scan_content(content)
+    eq(count, 0)
+    eq(result, content)
 
 
 def test_supported_blocks_pass():
@@ -266,9 +261,9 @@ t("未知 source.type 抛 400", test_source_unknown_type_raises)
 t("不支持 MIME 抛 400", test_invalid_mime_raises)
 t("非法 base64 抛 400", test_bad_base64_raises)
 
-# Unsupported block 测试
-print("\n── unsupported blocks ──")
-t("unsupported block 抛异常", test_unsupported_block_raises)
+# 非 image block 透明转发
+print("\n── non-image passthrough ──")
+t("unsupported block 透明转发", test_unsupported_block_passthrough)
 t("合法 block 不抛异常", test_supported_blocks_pass)
 
 # replace_images 纯函数测试
