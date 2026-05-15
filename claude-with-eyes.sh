@@ -10,29 +10,6 @@ DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$DIR"
 
 BASE_URL="http://127.0.0.1:8788"
-SETTINGS_PATH="$HOME/.claude/settings.json"
-
-python3 - "$SETTINGS_PATH" "$BASE_URL" <<'PY'
-import json
-import sys
-from pathlib import Path
-
-path = Path(sys.argv[1])
-base_url = sys.argv[2]
-
-if not path.exists():
-    raise SystemExit(0)
-
-data = json.loads(path.read_text())
-env = data.setdefault("env", {})
-old = env.get("ANTHROPIC_BASE_URL", "")
-
-if old != base_url:
-    env["ANTHROPIC_BASE_URL"] = base_url
-    path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n")
-    path.chmod(0o600)
-    print(f"已更新 {path}: ANTHROPIC_BASE_URL={base_url}")
-PY
 
 if bash start.sh; then
     :

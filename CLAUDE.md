@@ -2,6 +2,10 @@
 
 给 DeepSeek + Claude Code 加视觉能力。本地 HTTP 代理拦截 Anthropic 请求中的图片，通过豆包 Chat API 将图片转为文字描述（含坐标定位），再转发给 DeepSeek。
 
+## 约束
+
+如果要改代码，先跑测试，再提交改动。
+
 ## 快速开始
 
 ```bash
@@ -18,7 +22,7 @@ bash claude-with-eyes.sh
 ```
 
 不要把 `ANTHROPIC_BASE_URL` 设为 `https://api.deepseek.com/anthropic`，那会绕过本地代理，图片不会被转换。
-`~/.claude/settings.json` 里的 `env.ANTHROPIC_BASE_URL` 也必须是 `http://127.0.0.1:8788`；`claude-with-eyes.sh` 会自动修正它。
+`ANTHROPIC_BASE_URL` 默认为直连 DeepSeek（`https://api.deepseek.com/anthropic`），`claude-with-eyes.sh` 通过环境变量临时覆盖为 `http://127.0.0.1:8788`，不动 settings.json。
 
 ## 文件
 
