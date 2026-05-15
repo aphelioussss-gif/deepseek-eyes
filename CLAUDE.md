@@ -14,10 +14,11 @@ bash start.sh debug
 bash test_smoke.sh
 
 # 3. 生产模式
-bash start.sh
-export ANTHROPIC_BASE_URL=http://127.0.0.1:8788
-claude
+bash claude-with-eyes.sh
 ```
+
+不要把 `ANTHROPIC_BASE_URL` 设为 `https://api.deepseek.com/anthropic`，那会绕过本地代理，图片不会被转换。
+`~/.claude/settings.json` 里的 `env.ANTHROPIC_BASE_URL` 也必须是 `http://127.0.0.1:8788`；`claude-with-eyes.sh` 会自动修正它。
 
 ## 文件
 
@@ -29,6 +30,7 @@ claude
 | `vision_fake.py` | 假视觉（离线测试） |
 | `cache.py` | 线程安全图片缓存 |
 | `config.py` | .env 配置加载 |
+| `claude-with-eyes.sh` | 推荐启动入口，自动设置本地代理 base URL |
 
 ## 测试
 

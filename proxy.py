@@ -250,6 +250,13 @@ class ProxyHandler(BaseHTTPRequestHandler):
         t0 = time.time()
         image_count = 0
         image_details = []
+        _log(
+            "info",
+            request_id,
+            event="received",
+            path="/v1/messages",
+            content_length=self.headers.get("Content-Length", ""),
+        )
 
         body_bytes = self._read_body()
         if body_bytes is None:

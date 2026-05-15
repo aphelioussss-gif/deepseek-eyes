@@ -42,8 +42,13 @@ if kill -0 "$PID" 2>/dev/null; then
     echo "代理已启动 (pid=$PID)"
     echo "日志: tail -f $LOG_FILE"
     echo ""
-    echo "Claude Code 使用前设置:"
+    echo "Claude Code 必须指向本地代理，不要直连 https://api.deepseek.com/anthropic"
+    echo "推荐启动:"
+    echo "  bash claude-with-eyes.sh"
+    echo ""
+    echo "手动启动时使用:"
     echo "  export ANTHROPIC_BASE_URL=http://127.0.0.1:8788"
+    echo "  claude"
 else
     echo "启动失败，查看日志: $LOG_FILE"
     exit 1
