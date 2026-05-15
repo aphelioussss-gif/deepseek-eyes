@@ -7,7 +7,13 @@ import json
 import sys
 import traceback
 
-from proxy import _forward_sse_stream, _prepare_upstream_body, _sse_event_is_terminal
+from proxy import (
+    _build_upstream_headers,
+    _build_upstream_path,
+    _forward_sse_stream,
+    _prepare_upstream_body,
+    _sse_event_is_terminal,
+)
 
 
 PASS = 0
@@ -166,6 +172,122 @@ def test_prepare_direct_image_rewrites_body():
     assert "DESC 4 image/png" in block["text"]
 
 
+def test_build_upstream_headers_preserves_anthropic_headers():
+    inbound = {
+        "Content-Type": "application/json",
+        "Anthropic-Version": "2024-01-01",
+        "Anthropic-Beta": "tools-2024-05-01",
+        "User-Agent": "ClaudeCode/1.0",
+        "Connection": "keep-alive",
+        "Accept-Encoding": "gzip",
+    }
+
+    out = _build_upstream_headers(inbound, {"x-api-key": "sk-test"})
+
+    assert out["Content-Type"] == "application/json"
+    assert out["Anthropic-Version"] == "2024-01-01"
+    assert out["Anthropic-Beta"] == "tools-2024-05-01"
+    assert out["User-Agent"] == "ClaudeCode/1.0"
+    assert out["x-api-key"] == "sk-test"
+    assert "Connection" not in out
+    assert "Accept-Encoding" not in out
+
+
+def test_build_upstream_path_prefixes():
+    assert _build_upstream_path("/v1/messages") == "/anthropic/v1/messages"
+    assert _build_upstream_path("/v1/messages/count_tokens") == "/anthropic/v1/messages/count_tokens"
+    assert _build_upstream_path("/v1/models") == "/anthropic/v1/models"
+    assert _build_upstream_path("/health") == "/anthropic/health"
+
+
+def test_prepare_count_tokens_passthrough():
+    """count_tokens 类请求（相同的 messages 结构）也应透明通过。"""
+    payload = {
+        "model": "deepseek-v4-pro",
+        "messages": [
+            {"role": "user", "content": "count these tokens please"},
+            {"role": "assistant", "content": [
+                {"type": "text", "text": "sure"},
+                {"type": "tool_use", "id": "t1", "name": "Bash", "input": {"cmd": "ls"}},
+            ]},
+        ],
+        "system": "you are helpful",
+    }
+    body = json.dumps(payload, separators=(", ", ": ")).encode("utf-8")
+
+    upstream_body, parsed, count = _prepare_upstream_body(body, lambda b, m: "SHOULD_NOT_RUN")
+
+    assert count == 0
+    assert upstream_body == body
+    assert parsed["model"] == "deepseek-v4-pro"
+    assert parsed["system"] == "you are helpful"
+    assert len(parsed["messages"]) == 2
+    assert parsed["messages"][1]["content"][1]["type"] == "tool_use"
+
+
+class FakeUpstreamResp:
+    """模拟上游非 SSE 响应。"""
+    def __init__(self, status, headers, body):
+        self.status = status
+        self._headers = headers
+        self._body = body
+
+    def getheader(self, name, default=None):
+        for k, v in self._headers:
+            if k.lower() == name.lower():
+                return v
+        return default
+
+    def getheaders(self):
+        return list(self._headers)
+
+    def read(self):
+        return self._body
+
+    def readline(self):
+        raise AssertionError("should not be called for non-SSE")
+
+
+class FakeSSEResp:
+    """模拟上游 SSE 流式响应。"""
+    def __init__(self, lines):
+        self.status = 200
+        self._headers = [("Content-Type", "text/event-stream")]
+        self._lines = list(lines)
+        self._closed = False
+
+    def getheader(self, name, default=None):
+        for k, v in self._headers:
+            if k.lower() == name.lower():
+                return v
+        return default
+
+    def getheaders(self):
+        return list(self._headers)
+
+    def readline(self):
+        if not self._lines:
+            self._closed = True
+            return b""
+        return self._lines.pop(0)
+
+    def read(self):
+        raise AssertionError("should not be called for SSE")
+
+
+class FakeWfile:
+    def __init__(self):
+        self.parts = []
+        self.flushes = 0
+        self.headers_sent = False
+
+    def write(self, data):
+        self.parts.append(data)
+
+    def flush(self):
+        self.flushes += 1
+
+
 if __name__ == "__main__":
     print("DeepSeek Eyes proxy stream tests")
     print("================================")
@@ -175,6 +297,9 @@ if __name__ == "__main__":
     t("no-image request body is byte-for-byte passthrough", test_prepare_no_image_preserves_body_bytes)
     t("tool_use/tool_result are preserved", test_prepare_tool_blocks_preserved)
     t("direct image rewrites body", test_prepare_direct_image_rewrites_body)
+    t("Anthropic headers are preserved", test_build_upstream_headers_preserves_anthropic_headers)
+    t("_build_upstream_path prefixes /anthropic", test_build_upstream_path_prefixes)
+    t("count_tokens-like request passthrough", test_prepare_count_tokens_passthrough)
     print("================================")
     print(f"结果: {PASS} passed, {FAIL} failed, {PASS + FAIL} total")
     sys.exit(1 if FAIL else 0)

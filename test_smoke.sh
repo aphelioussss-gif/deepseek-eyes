@@ -88,10 +88,18 @@ echo "================================"
 echo "── 健康检查 ──"
 check "GET /health=200" "$(get /health)" "200" "contains" "ok"
 
-# ── 路由白名单 ──
-echo "── 路由白名单 ──"
-check "GET /404" "$(get /nonexistent)" "404" "contains" "proxy_error"
-check "POST /404" "$(post /nonexistent '{}')" "404" "contains" "proxy_error"
+# ── 透明转发（无认证返回 401）──
+echo "── 透明转发 ──"
+check "GET 透传缺auth→401" "$(get /nonexistent)" "401" "contains" "缺少认证"
+check "POST 透传缺auth→401" "$(post /nonexistent '{}')" "401" "contains" "缺少认证"
+# 带认证的 count_tokens 透传到 DeepSeek（DeepSeek 返回 401 因为测试 key 无效，证明透传成功）
+check "count_tokens 透传" "$(post_auth /v1/messages/count_tokens '{"model":"x","messages":[{"role":"user","content":"hi"}]}' "sk-test-001" "")" "401" "py_pass" "
+import sys,json
+d=json.load(sys.stdin)
+# DeepSeek 返回的错误，说明请求已到达 DeepSeek（非代理 404）
+assert 'error' in d
+sys.exit(0)
+"
 
 # ── Auth 透传 ──
 echo "── Auth header ──"

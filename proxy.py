@@ -3,6 +3,7 @@
 
 在 Claude Code 和 DeepSeek 之间拦截 Anthropic /v1/messages 请求，
 将 image block 替换为豆包视觉分析文本，转发给 DeepSeek。
+其他所有请求透明转发。
 
 启动:
   DEBUG + FAKE:  DEEPSEEK_EYES_DEBUG=1 DEEPSEEK_EYES_FAKE_VISION=1 python3 proxy.py
@@ -159,6 +160,43 @@ def _prepare_upstream_body(body_bytes: bytes, vision_fn=_process_image) -> tuple
     return transformed_body, parsed, total_count
 
 
+def _build_upstream_path(path: str) -> str:
+    """给所有上游请求统一加 /anthropic 前缀。"""
+    return "/anthropic" + path
+
+
+def _build_upstream_headers(inbound_headers, auth: dict) -> dict:
+    """Build upstream request headers while preserving Anthropic/tool headers.
+
+    We keep the inbound request as transparent as possible, but still drop
+    hop-by-hop headers and force a JSON content type for the request body.
+    """
+    hop_by_hop = {
+        "connection",
+        "content-length",
+        "host",
+        "keep-alive",
+        "proxy-connection",
+        "transfer-encoding",
+        "upgrade",
+        "accept-encoding",
+    }
+
+    out_headers = {}
+    for k, v in inbound_headers.items():
+        if k.lower() in hop_by_hop:
+            continue
+        out_headers[k] = v
+
+    out_headers["Content-Type"] = inbound_headers.get("Content-Type", "application/json")
+    out_headers.setdefault("Anthropic-Version", inbound_headers.get("Anthropic-Version", "2023-06-01"))
+
+    for k, v in auth.items():
+        out_headers[k] = v
+
+    return out_headers
+
+
 class ProxyHandler(BaseHTTPRequestHandler):
 
     def log_message(self, format, *args):
@@ -169,7 +207,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
     def _read_body(self) -> Optional[bytes]:
         cl = self.headers.get("Content-Length")
         if not cl:
-            self._send_error(400, "缺少 Content-Length"); return None
+            return b""
         try:
             cl = int(cl)
         except ValueError:
@@ -218,25 +256,20 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
     # ── upstream forwarding ───────────────────────────────
 
-    def _forward_to_deepseek(self, request_id: str, body_bytes: bytes, auth: dict, t0: float):
-        """转发请求到 DeepSeek，处理 SSE / 非流式。"""
-        out_headers = {
-            "Content-Type": "application/json",
-            "Anthropic-Version": "2023-06-01",
-        }
-        for k, v in auth.items():
-            out_headers[k] = v
+    def _forward_upstream(self, request_id: str, method: str, path: str,
+                          body_bytes: bytes, auth: dict, t0: float):
+        """通用上游转发。支持任意 HTTP 方法和路径，透明转发所有响应。
+
+        修复了 Content-Length fallback 为 "0" 的问题：非 SSE 响应先读完
+        upstream body，用实际长度设 Content-Length，再回传客户端。
+        """
+        out_headers = _build_upstream_headers(self.headers, auth)
 
         conn = http.client.HTTPSConnection(
             config.DEEPSEEK_HOST, timeout=600
         )
         try:
-            conn.request(
-                "POST",
-                config.DEEPSEEK_PATH,
-                body=body_bytes,
-                headers=out_headers,
-            )
+            conn.request(method, path, body=body_bytes, headers=out_headers)
             resp = conn.getresponse()
         except Exception as e:
             conn.close()
@@ -249,31 +282,34 @@ class ProxyHandler(BaseHTTPRequestHandler):
         upstream_ct = resp.getheader("Content-Type", "")
         is_sse = "text/event-stream" in upstream_ct.lower()
 
-        # 构造响应 headers，过滤 hop-by-hop
+        # 收集响应 headers，过滤 hop-by-hop，Content-Length 稍后统一处理
         response_headers = []
         for k, v in resp.getheaders():
             lk = k.lower()
             if lk in ("transfer-encoding", "connection", "content-length"):
                 continue
             response_headers.append((k, v))
-        if not is_sse:
-            response_headers.append(("Content-Length", resp.getheader("Content-Length", "0")))
-
-        self.send_response(upstream_status)
-        for k, v in response_headers:
-            self.send_header(k, v)
-        self.end_headers()
 
         client_closed = False
 
         try:
             if is_sse:
+                self.send_response(upstream_status)
+                for k, v in response_headers:
+                    self.send_header(k, v)
+                self.end_headers()
                 client_closed = _forward_sse_stream(resp, self.wfile)
             else:
-                # 非流式：直接读完整 body
+                # 先读完 upstream body，再用实际长度设 Content-Length
                 full_body = resp.read()
+                self.send_response(upstream_status)
+                for k, v in response_headers:
+                    self.send_header(k, v)
+                self.send_header("Content-Length", str(len(full_body)))
+                self.end_headers()
                 try:
                     self.wfile.write(full_body)
+                    self.wfile.flush()
                 except (BrokenPipeError, ConnectionResetError):
                     client_closed = True
         finally:
@@ -289,11 +325,36 @@ class ProxyHandler(BaseHTTPRequestHandler):
         _log(
             "info",
             request_id,
+            method=method,
+            upstream_path=path,
             upstream_status=str(upstream_status),
             sse=str(is_sse).lower(),
             client_closed=str(client_closed).lower(),
             duration_ms=str(duration_ms),
         )
+
+    def _transparent_forward(self, method: str):
+        """透明转发：不解析 body，原样传给 DeepSeek。
+
+        所有非 /v1/messages 的请求走这条路。
+        """
+        request_id = uuid.uuid4().hex[:12]
+        t0 = time.time()
+
+        body_bytes = b""
+        if method in ("POST", "PUT", "PATCH"):
+            body_bytes = self._read_body()
+            if body_bytes is None:
+                return
+
+        auth = self._forward_auth_headers()
+        if not auth:
+            _log("warn", request_id, error="no_auth")
+            self._send_error(401, "缺少认证 header (x-api-key 或 Authorization)")
+            return
+
+        upstream_path = _build_upstream_path(self.path.split("?")[0])
+        self._forward_upstream(request_id, method, upstream_path, body_bytes, auth, t0)
 
     # ── endpoint handlers ─────────────────────────────────
 
@@ -362,7 +423,8 @@ class ProxyHandler(BaseHTTPRequestHandler):
             self._send_error(401, "缺少认证 header (x-api-key 或 Authorization)")
             return
 
-        self._forward_to_deepseek(request_id, transformed_body, auth, t0)
+        self._forward_upstream(request_id, "POST", config.DEEPSEEK_PATH,
+                               transformed_body, auth, t0)
 
     # ── routing ───────────────────────────────────────────
 
@@ -373,14 +435,26 @@ class ProxyHandler(BaseHTTPRequestHandler):
         elif path == "/debug/transform" and config.DEBUG_MODE:
             self.handle_debug_transform()
         else:
-            self._send_error(404, f"未知路径: {self.path}")
+            self._transparent_forward("GET")
 
     def do_POST(self):
         path = self.path.split("?")[0]
         if path == "/v1/messages":
             self.handle_messages()
         else:
-            self._send_error(404, f"未知路径: {self.path}")
+            self._transparent_forward("POST")
+
+    def do_PUT(self):
+        self._transparent_forward("PUT")
+
+    def do_DELETE(self):
+        self._transparent_forward("DELETE")
+
+    def do_PATCH(self):
+        self._transparent_forward("PATCH")
+
+    def do_OPTIONS(self):
+        self._transparent_forward("OPTIONS")
 
 
 # ── 全局 ────────────────────────────────────────────
@@ -409,7 +483,7 @@ def main():
         file=sys.stderr,
     )
     dbg_endpoint = " /debug/transform" if config.DEBUG_MODE else ""
-    print(f"[deepseek-eyes] 端点: /health /v1/messages{dbg_endpoint}", file=sys.stderr)
+    print(f"[deepseek-eyes] 端点: /health /v1/messages{dbg_endpoint}（其他全部透传）", file=sys.stderr)
 
     try:
         server.serve_forever()
