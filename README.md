@@ -31,14 +31,7 @@ cp .env.example .env
 # 编辑 .env，填入 ARK_API_KEY=ark-xxx
 ```
 
-### 4. 离线测试（不调真实 API）
-
-```bash
-bash start.sh debug
-bash test_smoke.sh
-```
-
-### 5. 生产模式
+### 4. 启动
 
 ```bash
 bash claude-with-eyes.sh
@@ -68,8 +61,8 @@ bash claude-with-eyes.sh
 
 ```bash
 python3 test_transformer.py          # 15 单测
-python3 test_proxy_stream.py         # SSE + 透明转发单测
-bash start.sh debug && bash test_smoke.sh  # 14 冒烟测试
+python3 test_proxy_stream.py         # 20 单测（SSE + 透明转发）
+bash start.sh && bash test_smoke.sh  # 15 冒烟测试 (需先启动代理)
 ```
 
 ## 文件
@@ -79,14 +72,9 @@ bash start.sh debug && bash test_smoke.sh  # 14 冒烟测试
 | `proxy.py` | ThreadingHTTPServer 主代理 |
 | `transformer.py` | image block 替换，不介入工具块 |
 | `vision.py` | 豆包 Chat API |
-| `vision_fake.py` | 假视觉（离线测试） |
 | `cache.py` | 线程安全图片缓存 |
 | `config.py` | .env 配置加载 |
 | `claude-with-eyes.sh` | 推荐启动入口 |
-
-## 架构决策
-
-详见 [MEMORY.md](MEMORY.md) — 为什么选豆包、为什么双输出（描述+坐标）、缓存策略等。
 
 ## License
 
