@@ -68,9 +68,10 @@ def test_terminal_anthropic_message_stop():
     resp = FakeResp(lines)
     wfile = FakeWfile()
 
-    client_closed = _forward_sse_stream(resp, wfile)
+    client_closed, end_reason = _forward_sse_stream(resp, wfile)
 
     assert client_closed is False
+    assert end_reason == "terminal_event"
     assert b"".join(wfile.parts).endswith(b'{"type":"message_stop"}\n\n')
     assert resp.reads == 6
 
@@ -85,15 +86,122 @@ def test_terminal_openai_done():
     resp = FakeResp(lines)
     wfile = FakeWfile()
 
-    client_closed = _forward_sse_stream(resp, wfile)
+    client_closed, end_reason = _forward_sse_stream(resp, wfile)
 
     assert client_closed is False
+    assert end_reason == "terminal_event"
     assert b"".join(wfile.parts).endswith(b"data: [DONE]\n\n")
     assert resp.reads == 4
 
 
 def test_nonterminal_event():
     assert _sse_event_is_terminal([b"event: message_delta\n", b"data: {}\n"]) is False
+
+
+def test_terminal_json_message_stop_type():
+    """data: {"type":"message_stop"} → terminal"""
+    assert _sse_event_is_terminal([b'data: {"type":"message_stop"}\n']) is True
+
+
+def test_terminal_json_delta_stop_reason():
+    """data: {"type":"message_delta","delta":{"stop_reason":"end_turn"}} → terminal"""
+    assert _sse_event_is_terminal([
+        b'data: {"type":"message_delta","delta":{"stop_reason":"end_turn"}}\n'
+    ]) is True
+
+
+def test_terminal_json_top_level_stop_reason():
+    """data: {"stop_reason":"max_tokens"} → terminal"""
+    assert _sse_event_is_terminal([b'data: {"stop_reason":"max_tokens"}\n']) is True
+
+
+def test_nonterminal_json_content_block():
+    """data: {"type":"content_block_delta","delta":{"text":"hi"}} → not terminal"""
+    assert _sse_event_is_terminal([
+        b'data: {"type":"content_block_delta","delta":{"text":"hi"}}\n'
+    ]) is False
+
+
+def test_nonterminal_json_empty_stop_reason():
+    """data: {"stop_reason":""} → not terminal (empty string)"""
+    assert _sse_event_is_terminal([b'data: {"stop_reason":""}\n']) is False
+
+
+def test_nonterminal_json_null_stop_reason():
+    """data: {"stop_reason":null} → not terminal"""
+    assert _sse_event_is_terminal([b'data: {"stop_reason":null}\n']) is False
+
+
+def test_terminal_json_message_delta_empty_stop_reason():
+    """data: {"type":"message_delta","delta":{"stop_reason":""}} → not terminal"""
+    assert _sse_event_is_terminal([
+        b'data: {"type":"message_delta","delta":{"stop_reason":""}}\n'
+    ]) is False
+
+
+def test_nonterminal_json_malformed():
+    """Malformed JSON in data: line → not terminal, no crash"""
+    assert _sse_event_is_terminal([b'data: {not json}\n']) is False
+
+
+class FakeIdleTimeoutResp:
+    """SSE 上游先发部分数据，然后 socket.timeout。"""
+    def __init__(self):
+        self._lines = [
+            b'data: {"type":"content_block_start"}\n',
+            b"\n",
+        ]
+        self._calls = 0
+
+    def readline(self):
+        import socket
+        if self._calls < len(self._lines):
+            line = self._lines[self._calls]
+            self._calls += 1
+            return line
+        raise socket.timeout("read timed out")
+
+
+def test_idle_timeout_ends_stream():
+    resp = FakeIdleTimeoutResp()
+    wfile = FakeWfile()
+
+    client_closed, end_reason = _forward_sse_stream(resp, wfile)
+
+    assert client_closed is False
+    assert end_reason == "idle_timeout"
+    assert wfile.parts  # 部分数据已转发
+
+
+def test_idle_timeout_disabled_when_no_conn():
+    """conn=None 时不设 socket timeout，旧行为保持不变。"""
+    lines = [
+        b"data: [DONE]\n",
+        b"\n",
+    ]
+    resp = FakeResp(lines)
+    wfile = FakeWfile()
+
+    client_closed, end_reason = _forward_sse_stream(resp, wfile, conn=None)
+
+    assert client_closed is False
+    assert end_reason == "terminal_event"
+
+
+def test_connection_closed_end_reason():
+    """上游直接关闭连接 → end_reason=connection_closed"""
+
+    class FakeClosedResp:
+        def readline(self):
+            return b""
+
+    resp = FakeClosedResp()
+    wfile = FakeWfile()
+
+    client_closed, end_reason = _forward_sse_stream(resp, wfile)
+
+    assert client_closed is False
+    assert end_reason == "connection_closed"
 
 
 def test_prepare_no_image_preserves_body_bytes():
@@ -294,6 +402,17 @@ if __name__ == "__main__":
     t("Anthropic message_stop ends stream", test_terminal_anthropic_message_stop)
     t("OpenAI [DONE] ends stream", test_terminal_openai_done)
     t("nonterminal event continues", test_nonterminal_event)
+    t("JSON message_stop type → terminal", test_terminal_json_message_stop_type)
+    t("JSON delta.stop_reason → terminal", test_terminal_json_delta_stop_reason)
+    t("JSON top-level stop_reason → terminal", test_terminal_json_top_level_stop_reason)
+    t("JSON content_block_delta → not terminal", test_nonterminal_json_content_block)
+    t("JSON empty stop_reason → not terminal", test_nonterminal_json_empty_stop_reason)
+    t("JSON null stop_reason → not terminal", test_nonterminal_json_null_stop_reason)
+    t("JSON delta empty stop_reason → not terminal", test_terminal_json_message_delta_empty_stop_reason)
+    t("JSON malformed → not terminal, no crash", test_nonterminal_json_malformed)
+    t("idle timeout ends stream", test_idle_timeout_ends_stream)
+    t("conn=None preserves old behaviour", test_idle_timeout_disabled_when_no_conn)
+    t("connection closed end_reason", test_connection_closed_end_reason)
     t("no-image request body is byte-for-byte passthrough", test_prepare_no_image_preserves_body_bytes)
     t("tool_use/tool_result are preserved", test_prepare_tool_blocks_preserved)
     t("direct image rewrites body", test_prepare_direct_image_rewrites_body)

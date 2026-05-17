@@ -1,6 +1,6 @@
 #!/bin/bash
 # DeepSeek Eyes — 冒烟测试
-# 前提: DEEPSEEK_EYES_DEBUG=1 DEEPSEEK_EYES_FAKE_VISION=1 python3 proxy.py &
+# 前提: python3 proxy.py & (需 .env 中 ARK_API_KEY)
 # 运行: bash test_smoke.sh
 
 set -e
@@ -111,7 +111,6 @@ check "Bearer" "$(post_auth /v1/messages "$NOIMG" "" "sk-bearer-002")" "200" "co
 echo "── 图片替换 ──"
 IMG=$(json '{"model":"x","messages":[{"role":"user","content":[{"type":"text","text":"hi"},{"type":"image","source":{"type":"base64","media_type":"image/png","data":"'"$TEST_IMG_B64"'"}}]}],"max_tokens":10}')
 check "image→text" "$(post /v1/messages "$IMG")" "200" "contains" "[视觉分析]"
-check "FAKE标记" "$(post /v1/messages "$IMG")" "200" "contains" "[FAKE]"
 check "image_count=1" "$(post /v1/messages "$IMG")" "200" "json_int" "image_count=1"
 
 # ── tool_use.input 保护 ──

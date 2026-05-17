@@ -6,7 +6,6 @@
 其他所有请求透明转发。
 
 启动:
-  DEBUG + FAKE:  DEEPSEEK_EYES_DEBUG=1 DEEPSEEK_EYES_FAKE_VISION=1 python3 proxy.py
   PRODUCTION:    python3 proxy.py  (需 .env 中 ARK_API_KEY)
 """
 
@@ -25,9 +24,6 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from transformer import ImageSourceError, scan_content
 from cache import get_or_compute
-from vision_fake import analyze_image as fake_analyze
-
-
 def _real_analyze(raw_bytes, mime):
     """调真实豆包 API（延迟 import，避免离线模式因缺依赖崩溃）。"""
     from vision import analyze_image as real_analyze_fn
@@ -35,8 +31,6 @@ def _real_analyze(raw_bytes, mime):
 
 
 def _vision_compute_fn(raw_bytes, mime):
-    if config.FAKE_VISION:
-        return fake_analyze(raw_bytes, mime)
     return _real_analyze(raw_bytes, mime)
 
 
@@ -90,10 +84,16 @@ def _log(level: str, request_id: str, **kwargs):
 def _sse_event_is_terminal(lines: Iterable[bytes]) -> bool:
     """Return True when an SSE event is the final model event.
 
-    Anthropic-compatible streams end with ``event: message_stop``. Some
-    OpenAI-compatible streams end with ``data: [DONE]``. The proxy should stop
-    reading once either is forwarded, because some upstreams keep the HTTP
-    connection open briefly after the logical stream is complete.
+    Detects terminal signals across three formats:
+
+    * Anthropic SSE: ``event: message_stop``
+    * OpenAI SSE: ``data: [DONE]``
+    * JSON payload: ``{"type":"message_stop"}``, ``{"type":"message_delta",
+      "delta":{"stop_reason":"..."}}``, or top-level ``{"stop_reason":"..."}``
+
+    The JSON-path detection handles DeepSeek's Anthropic-compatible endpoint,
+    which may embed stop_reason inside a message_delta event rather than
+    emitting an explicit message_stop event.
     """
     for raw_line in lines:
         line = raw_line.strip()
@@ -101,17 +101,51 @@ def _sse_event_is_terminal(lines: Iterable[bytes]) -> bool:
             return True
         if line == b"data: [DONE]":
             return True
+        if line.startswith(b"data: "):
+            json_str = line[len(b"data: "):]
+            try:
+                payload = json.loads(json_str)
+            except (json.JSONDecodeError, ValueError):
+                continue
+            if isinstance(payload, dict):
+                if payload.get("type") == "message_stop":
+                    return True
+                if payload.get("stop_reason"):
+                    return True
+                delta = payload.get("delta")
+                if isinstance(delta, dict) and delta.get("stop_reason"):
+                    return True
     return False
 
 
-def _forward_sse_stream(resp, wfile) -> bool:
+def _forward_sse_stream(resp, wfile, conn=None) -> tuple:
     """Forward an SSE stream and stop at the logical terminal event.
 
-    Returns True if the downstream client closed the connection.
+    Returns (client_closed, end_reason) where end_reason is one of:
+      terminal_event  — recognised terminal SSE event
+      idle_timeout    — no data on the socket for SSE_IDLE_TIMEOUT seconds
+      connection_closed — upstream closed the connection (readline returned empty)
+
+    When conn is provided and SSE_IDLE_TIMEOUT > 0, sets a read timeout on the
+    underlying socket so that a stalled stream is terminated cleanly instead of
+    blocking for up to the connection-level 600 s timeout.
     """
+    import socket
+
+    if conn is not None and config.SSE_IDLE_TIMEOUT > 0:
+        try:
+            conn.sock.settimeout(config.SSE_IDLE_TIMEOUT)
+        except Exception:
+            pass
+
     event_lines = []
+    end_reason = "connection_closed"
     while True:
-        line = resp.readline()
+        try:
+            line = resp.readline()
+        except socket.timeout:
+            end_reason = "idle_timeout"
+            break
         if not line:
             break
         event_lines.append(line)
@@ -119,12 +153,13 @@ def _forward_sse_stream(resp, wfile) -> bool:
             wfile.write(line)
             wfile.flush()
         except (BrokenPipeError, ConnectionResetError):
-            return True
+            return True, "client_closed"
         if line in (b"\n", b"\r\n"):
             if _sse_event_is_terminal(event_lines):
+                end_reason = "terminal_event"
                 break
             event_lines = []
-    return False
+    return False, end_reason
 
 
 def _prepare_upstream_body(body_bytes: bytes, vision_fn=_process_image) -> tuple:
@@ -291,6 +326,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
             response_headers.append((k, v))
 
         client_closed = False
+        end_reason = ""
 
         try:
             if is_sse:
@@ -298,7 +334,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 for k, v in response_headers:
                     self.send_header(k, v)
                 self.end_headers()
-                client_closed = _forward_sse_stream(resp, self.wfile)
+                client_closed, end_reason = _forward_sse_stream(resp, self.wfile, conn)
             else:
                 # 先读完 upstream body，再用实际长度设 Content-Length
                 full_body = resp.read()
@@ -322,9 +358,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 conn.close()
 
         duration_ms = int((time.time() - t0) * 1000)
-        _log(
-            "info",
-            request_id,
+        log_kwargs = dict(
             method=method,
             upstream_path=path,
             upstream_status=str(upstream_status),
@@ -332,6 +366,9 @@ class ProxyHandler(BaseHTTPRequestHandler):
             client_closed=str(client_closed).lower(),
             duration_ms=str(duration_ms),
         )
+        if end_reason:
+            log_kwargs["sse_end_reason"] = end_reason
+        _log("info", request_id, **log_kwargs)
 
     def _transparent_forward(self, method: str):
         """透明转发：不解析 body，原样传给 DeepSeek。
@@ -472,8 +509,6 @@ def main():
     mode = []
     if config.DEBUG_MODE:
         mode.append("DEBUG")
-    if config.FAKE_VISION:
-        mode.append("FAKE_VISION")
     mode_str = "+".join(mode) if mode else "PRODUCTION"
 
     server = ThreadingHTTPServer((config.PROXY_HOST, config.PROXY_PORT), ProxyHandler)

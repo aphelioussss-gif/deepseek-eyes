@@ -1,9 +1,7 @@
 #!/bin/bash
 # DeepSeek Eyes — 启动代理
-# 用法: bash start.sh [debug|fake]
-#   debug  → DEEPSEEK_EYES_DEBUG=1 + FAKE_VISION=1 (离线测试)
-#   fake   → DEEPSEEK_EYES_FAKE_VISION=1 (假视觉+真实DeepSeek转发)
-#   无参数 → 生产模式 (真实豆包+真实DeepSeek)
+# 用法: bash start.sh
+#   生产模式 (真实豆包+真实DeepSeek)
 
 set -e
 
@@ -18,20 +16,7 @@ if [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
     exit 1
 fi
 
-case "${1:-}" in
-    debug)
-        export DEEPSEEK_EYES_DEBUG=1
-        export DEEPSEEK_EYES_FAKE_VISION=1
-        echo "启动模式: DEBUG + FAKE_VISION (离线测试)"
-        ;;
-    fake)
-        export DEEPSEEK_EYES_FAKE_VISION=1
-        echo "启动模式: FAKE_VISION (假视觉+真实转发)"
-        ;;
-    *)
-        echo "启动模式: PRODUCTION (真实豆包+真实DeepSeek)"
-        ;;
-esac
+echo "启动模式: PRODUCTION (真实豆包+真实DeepSeek)"
 
 nohup python3 proxy.py > "$LOG_FILE" 2>&1 &
 PID=$!

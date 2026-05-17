@@ -9,7 +9,7 @@ import sys
 from pathlib import Path
 
 PROJECT_DIR = Path(__file__).resolve().parent
-PROJECT_VERSION = "v1.2-lite"
+PROJECT_VERSION = "v1.3-lite"
 
 
 def _load_dotenv():
@@ -103,9 +103,11 @@ CACHE_FILE_MODE = 0o600
 MAX_IMAGE_RAW_BYTES = _env_int("MAX_IMAGE_RAW_BYTES", 10 * 1024 * 1024)
 MAX_REQUEST_BODY_BYTES = _env_int("MAX_REQUEST_BODY_BYTES", 32 * 1024 * 1024)
 
+# === 超时 ===
+SSE_IDLE_TIMEOUT = _env_int("DEEPSEEK_EYES_SSE_IDLE_TIMEOUT", 30)  # 0 = 关闭空闲超时
+
 # === 调试 ===
 DEBUG_MODE = _env_bool("DEEPSEEK_EYES_DEBUG", False)
-FAKE_VISION = _env_bool("DEEPSEEK_EYES_FAKE_VISION", False)
 
 # === DeepSeek（文本）===
 DEEPSEEK_HOST = "api.deepseek.com"
@@ -118,8 +120,8 @@ LOG_FILE = _env_str("DEEPSEEK_EYES_LOG", "")
 def validate():
     """检查配置完整性。返回 (ok, errors)。"""
     errors = []
-    if not FAKE_VISION and not ARK_API_KEY:
-        errors.append("ARK_API_KEY 未设置（真实视觉模式需要）。或设置 DEEPSEEK_EYES_FAKE_VISION=1")
+    if not ARK_API_KEY:
+        errors.append("ARK_API_KEY 未设置")
     if VISION_FAIL_MODE not in ("placeholder", "block"):
         errors.append(f"VISION_FAIL_MODE 无效值: {VISION_FAIL_MODE}")
     if ARK_BASE_URL.endswith("/api/v3") and VISION_MODEL_RAW.lower() == "doubao-seed-2.0-lite":
